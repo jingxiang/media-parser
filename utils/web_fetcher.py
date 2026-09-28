@@ -1,6 +1,7 @@
 import re
 import requests
 import random
+from src.utils.parser_transport import ParserSession, current_attempt
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 from configs.logging_config import get_logger
 from configs.general_constants import USER_AGENT_PC, DOMAIN_TO_NAME
@@ -49,7 +50,11 @@ class WebFetcher:
             current_url = url
             for _ in range(max_redirects):
                 # 发送请求，禁止重定向
-                resp = requests.get(current_url, headers=WebFetcher.headers, allow_redirects=False, timeout=5)
+                if current_attempt():
+                    with ParserSession() as session:
+                        resp = session.get(current_url, headers=WebFetcher.headers, allow_redirects=False, timeout=5)
+                else:
+                    resp = requests.get(current_url, headers=WebFetcher.headers, allow_redirects=False, timeout=5)
                 resp.raise_for_status()
                 redirect_url = resp.headers.get("location")
                 if not redirect_url and resp.status_code == 200 and isinstance(getattr(resp, "text", None), str):

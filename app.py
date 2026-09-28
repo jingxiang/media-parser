@@ -9,6 +9,7 @@ from src.auth import bp as auth_bp, register_template_helpers
 from src.web.portal import bp as portal_bp
 from src.web.admin import bp as admin_bp
 from src.db import init_app as init_database
+from src.utils.proxy_manager import ProxyManager
 from configs.logging_config import get_logger
 
 logger = get_logger(__name__)
@@ -43,6 +44,7 @@ def create_app(config=None):
     app.config['DATABASE'] = os.getenv(
         'DATABASE_PATH', os.path.join(app.instance_path, 'media_parser.db')
     )
+    app.config['JULIANG_PROXY_API_URL'] = os.getenv('JULIANG_PROXY_API_URL', '').strip()
     app.config['MAX_CONTENT_LENGTH'] = 32 * 1024
     app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=30)
     app.config['JSON_SORT_KEYS'] = False
@@ -63,6 +65,10 @@ def create_app(config=None):
     if not app.config.get('SECRET_KEY'):
         app.config['SECRET_KEY'] = _load_or_create_secret(database_dir or app.instance_path)
     init_database(app)
+    manager = ProxyManager(app.config["DATABASE"], app.config["JULIANG_PROXY_API_URL"])
+    app.extensions["proxy_manager"] = manager
+    if not app.testing:
+        manager.start()
 
     # 注册蓝图
     app.register_blueprint(api_bp, url_prefix='/api')

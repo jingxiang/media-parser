@@ -4,6 +4,9 @@ from flask import Blueprint, current_app, jsonify, request
 from configs.logging_config import get_logger
 from utils.web_fetcher import WebFetcher, UrlParser
 from src.parser_factory import ParserFactory
+from src.utils.parser_transport import (
+    Attempt, ParseFailure, ProxyAccessFailure, attempt_context,
+)
 from src.api.response import make_response
 from src.db import refund_user_credit, reserve_user_credit
 from src.api.access import (
@@ -104,6 +107,8 @@ def _execute_parse(text, access):
     status = 500
     credit_reserved = False
     credit_committed = False
+    credit_checked = False
+    checked_platforms = set()
     try:
         if not isinstance(text, str) or not text.strip():
             response, status = make_response(400, '请提供包含分享链接的文本', None, False, 'INVALID_TEXT'), 400
@@ -117,50 +122,25 @@ def _execute_parse(text, access):
             response, status = make_response(400, '未找到有效的分享链接', None, False, 'URL_NOT_FOUND'), 400
             return response, status
 
-        # 1. 解析基础信息
-        redirect_url = WebFetcher.fetch_redirect_url(share_url)
-        if not redirect_url:
-            if not WebFetcher._is_allowed_target(share_url):
-                logger.error(f'This link is not supported for extraction: {share_url}')
-                response, status = make_response(400, '该链接尚未支持提取', None, False, 'PLATFORM_NOT_SUPPORTED'), 400
-                return response, status
-            platform = UrlParser.get_platform(share_url)
-            response, status = make_response(400, '无法访问或识别该分享链接', None, False, 'REDIRECT_FAILED'), 400
-            return response, status
+        def before_parse(resolved_platform):
+            nonlocal platform, credit_reserved, credit_checked
+            platform = resolved_platform
+            denied = platform_access(platform) if platform not in checked_platforms else None
+            if denied:
+                denied_status, message, code = denied
+                raise ParseFailure(denied_status, code, message)
+            checked_platforms.add(platform)
+            if access and access["user_id"] and not credit_checked:
+                reservation = reserve_user_credit(access["user_id"])
+                if reservation is None:
+                    raise ParseFailure(402, 'INSUFFICIENT_CREDITS', '账号解析积分已耗尽，请联系管理员充值')
+                credit_reserved = reservation
+                credit_checked = True
 
-        platform = UrlParser.get_platform(redirect_url)
-        real_url = UrlParser.extract_video_address(redirect_url)
-        logger.debug(f'real_url {real_url}')
-
-        if not platform:
-            logger.error(f'This link is not supported for extraction: {real_url}')
-            response, status = make_response(400, '该链接尚未支持提取', None, False, 'PLATFORM_NOT_SUPPORTED'), 400
-            return response, status
-
-        denied = platform_access(platform)
-        if denied:
-            status, message, code = denied
-            response = make_response(status, message, None, False, code)
-            return response, status
-
-        if access and access["user_id"]:
-            reservation = reserve_user_credit(access["user_id"])
-            if reservation is None:
-                response, status = make_response(
-                    402,
-                    '账号解析积分已耗尽，请联系管理员充值',
-                    None,
-                    False,
-                    'INSUFFICIENT_CREDITS',
-                ), 402
-                return response, status
-            credit_reserved = reservation
-
-        # 2. 获取解析器
-        parser = ParserFactory.create_parser(platform, real_url)
-        
-        # 3. 核心抓取逻辑
-        content_data = _fetch_with_retry(parser, platform)
+        platform = UrlParser.get_platform(share_url)
+        redirect_url, platform, parser, content_data = _resolve_and_fetch(
+            share_url, before_parse, started + 90,
+        )
 
         if (
             not content_data['video_url']
@@ -168,13 +148,23 @@ def _execute_parse(text, access):
             and not content_data['image_list']
             and not content_data.get('audio_url')
         ):
-            terminal_detail = getattr(parser, 'terminal_error', None) or getattr(parser, '_terminal_filter_detail', None)
+            terminal_detail = _terminal_detail(parser)
             if isinstance(terminal_detail, dict):
                 detail_msg = terminal_detail.get('detail_msg') or terminal_detail.get('notice') or '该内容可能为私密/日常作品或已被作者删除'
-                err_code = terminal_detail.get('error_code') or 'MEDIA_DELETED_OR_PRIVATE'
+                err_code = terminal_detail.get('error_code') or (
+                    _cookie_code(platform) if _is_cookie_detail(terminal_detail) else 'MEDIA_DELETED_OR_PRIVATE'
+                )
                 if isinstance(detail_msg, str) and detail_msg.strip():
                     response, status = make_response(400, detail_msg.strip(), None, False, err_code), 400
                     return response, status
+            is_no_media = getattr(parser, 'no_media_in_content', False)
+            if is_no_media is True or (
+                type(is_no_media).__name__ not in ('Mock', 'MagicMock')
+                and platform in ('豆包', '通义千问', '腾讯元宝', '夸克AI', '小云雀AI')
+                and (content_data.get('title') or content_data.get('desc'))
+            ):
+                response, status = make_response(400, '该分享内容仅包含文本对话，未包含图片或视频资源', None, False, 'NO_MEDIA_IN_CONTENT'), 400
+                return response, status
             if platform == '小红书':
                 response, status = make_response(400, '解析失败：该链接需要小红书登录 Cookie 校验，请在配置中提供有效 Cookie 后重试', None, False, 'XIAOHONGSHU_COOKIE_REQUIRED'), 400
                 return response, status
@@ -186,14 +176,6 @@ def _execute_parse(text, access):
                 return response, status
             if platform == '快手' and getattr(parser, 'cookie_required', False):
                 response, status = make_response(400, '解析失败：该链接触发快手安全校验，请在配置中提供有效快手 Cookie 后重试', None, False, 'KUAISHOU_COOKIE_REQUIRED'), 400
-                return response, status
-            is_no_media = getattr(parser, 'no_media_in_content', False)
-            if is_no_media is True or (
-                type(is_no_media).__name__ not in ('Mock', 'MagicMock')
-                and platform in ('豆包', '通义千问', '腾讯元宝', '夸克AI', '小云雀AI')
-                and (content_data.get('title') or content_data.get('desc'))
-            ):
-                response, status = make_response(400, '该分享内容仅包含文本对话，未包含图片或视频资源', None, False, 'NO_MEDIA_IN_CONTENT'), 400
                 return response, status
             response, status = make_response(400, '提取媒体内容失败，请检查链接或稍后重试', None, False, 'MEDIA_NOT_FOUND'), 400
             return response, status
@@ -258,6 +240,9 @@ def _execute_parse(text, access):
         credit_committed = True
         return response, status
 
+    except ParseFailure as exc:
+        response, status = make_response(exc.status, exc.message, None, False, exc.code), exc.status
+        return response, status
     except Exception as e:
         logger.exception("Parse Error") # 使用 exception 会带上堆栈信息
         response, status = make_response(500, '功能太火爆啦，请稍后再试', None, False, 'INTERNAL_ERROR'), 500
@@ -281,6 +266,147 @@ def _execute_parse(text, access):
                 )
             except Exception:
                 logger.exception("Request log write failed")
+
+
+def _terminal_detail(parser):
+    for name in ('terminal_error', '_terminal_filter_detail'):
+        detail = getattr(parser, name, None)
+        if isinstance(detail, dict) and detail:
+            return detail
+    return None
+
+
+def _is_cookie_detail(detail):
+    code = str(detail.get('error_code', '')).upper()
+    message = str(detail.get('detail_msg') or detail.get('notice') or '').lower()
+    return 'COOKIE' in code or 'cookie' in message
+
+
+def _cookie_code(platform):
+    return {
+        '小红书': 'XIAOHONGSHU_COOKIE_REQUIRED',
+        '拼多多': 'PINDUODUO_COOKIE_REQUIRED',
+        '视频号': 'WECHAT_CHANNELS_COOKIE_REQUIRED',
+        '微信视频号': 'WECHAT_CHANNELS_COOKIE_REQUIRED',
+        '快手': 'KUAISHOU_COOKIE_REQUIRED',
+    }.get(platform, 'COOKIE_REQUIRED')
+
+
+def _result_kind(parser, data, platform):
+    if any(data.get(key) for key in ('video_url', 'video_list', 'image_list', 'audio_url')):
+        return 'success'
+    detail = _terminal_detail(parser)
+    if detail:
+        return 'cookie' if _is_cookie_detail(detail) else 'content'
+    if getattr(parser, 'no_media_in_content', False) is True:
+        return 'content'
+    if (platform in ('豆包', '通义千问', '腾讯元宝', '夸克AI', '小云雀AI')
+            and (data.get('title') or data.get('desc'))):
+        return 'content'
+    if getattr(parser, 'cookie_required', False) is True:
+        return 'cookie'
+    # 沿用原接口的 Cookie 兜底条件，明确的内容错误已经在上方排除。
+    if platform in ('小红书', '拼多多', '视频号', '微信视频号'):
+        return 'cookie'
+    return 'empty'
+
+
+def _resolve_and_fetch(share_url, before_parse, deadline):
+    """完整重建每次解析；计费与日志由外层请求统一处理。"""
+    manager = current_app.extensions['proxy_manager']
+    if not current_app.testing:
+        manager.start()
+    platform = UrlParser.get_platform(share_url)
+    using_proxy = manager.active(platform)
+    tried = set()
+    extractions = 0
+    last_cookie_result = None
+    use_token = None
+    try:
+        while True:
+            if time.monotonic() >= deadline:
+                raise ParseFailure(504, 'PARSE_TIMEOUT', '解析超时，请稍后重试')
+            proxy = None
+            if using_proxy:
+                if use_token is None:
+                    use_token = manager.begin_use(max(0, deadline - time.monotonic()))
+                if len(tried) >= 3:
+                    if last_cookie_result:
+                        return last_cookie_result
+                    raise ParseFailure(502, 'PROXY_RETRY_EXHAUSTED', '代理访问失败，已达到重试上限')
+                proxy = manager.available(tried)
+                while proxy is None and extractions < 3:
+                    if time.monotonic() >= deadline:
+                        raise ParseFailure(504, 'PARSE_TIMEOUT', '解析超时，请稍后重试')
+                    if manager.replenish(deadline):
+                        extractions += 1
+                    proxy = manager.available(tried)
+                    if proxy is None:
+                        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                if proxy is None:
+                    if time.monotonic() >= deadline:
+                        raise ParseFailure(504, 'PARSE_TIMEOUT', '解析超时，请稍后重试')
+                    raise ParseFailure(503, 'PROXY_UNAVAILABLE', '暂时无法获取可用代理，请稍后重试')
+                tried.add(proxy.address)
+                last_cookie_result = None
+                logger.info('平台 %s 使用代理 %s，尝试 %s/3', platform, proxy.address, len(tried))
+
+            attempt = Attempt(deadline, manager, proxy)
+            try:
+                with attempt_context(attempt):
+                    redirect_url = WebFetcher.fetch_redirect_url(share_url)
+                    attempt.check()
+                    if not redirect_url:
+                        if not WebFetcher._is_allowed_target(share_url):
+                            raise ParseFailure(400, 'PLATFORM_NOT_SUPPORTED', '该链接尚未支持提取')
+                        if proxy:
+                            attempt.fail_proxy('分享链接访问失败')
+                        if attempt.cookie_required and manager.enabled and platform:
+                            before_parse(platform)
+                            manager.activate(platform)
+                            using_proxy = True
+                            continue
+                        raise ParseFailure(400, 'REDIRECT_FAILED', '无法访问或识别该分享链接')
+                    platform = UrlParser.get_platform(redirect_url)
+                    if not platform:
+                        raise ParseFailure(400, 'PLATFORM_NOT_SUPPORTED', '该链接尚未支持提取')
+                    before_parse(platform)
+                    # 分享域名无法判断平台时，解析出平台后仍须遵守已生效的代理窗口。
+                    if not using_proxy and manager.active(platform):
+                        using_proxy = True
+                        continue
+                    parser = ParserFactory.create_parser(platform, UrlParser.extract_video_address(redirect_url))
+                    attempt.check()
+                    data = _fetch_with_retry(parser, platform)
+                    attempt.check()
+                    result = (redirect_url, platform, parser, data)
+                    kind = _result_kind(parser, data, platform)
+                    if kind == 'empty' and attempt.cookie_required:
+                        kind = 'cookie'
+                        parser.terminal_error = {'error_code': _cookie_code(platform), 'detail_msg': '平台要求 Cookie 或登录校验'}
+                    if kind != 'cookie' or not manager.enabled:
+                        return result
+                    last_cookie_result = result
+                    if proxy:
+                        attempt.fail_proxy('平台仍要求 Cookie 校验')
+                    manager.activate(platform)
+                    using_proxy = True
+            except ProxyAccessFailure:
+                if attempt.cookie_required and len(tried) >= 3:
+                    raise ParseFailure(400, _cookie_code(platform), '平台仍要求 Cookie 或登录校验，请配置有效 Cookie 后重试')
+                # 解析器内部可能捕获网络异常；上下文会阻止它再使用失效 IP。
+                continue
+            except Exception:
+                if isinstance(attempt.failure, ProxyAccessFailure):
+                    if attempt.cookie_required and len(tried) >= 3:
+                        raise ParseFailure(400, _cookie_code(platform), '平台仍要求 Cookie 或登录校验，请配置有效 Cookie 后重试')
+                    continue
+                if attempt.failure:
+                    raise attempt.failure
+                raise
+    finally:
+        if use_token:
+            manager.end_use(use_token)
 
 
 def _fetch_with_retry(parser, platform):
