@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 from utils.web_fetcher import UrlParser
 from src.parsers.base_parser import BaseParser
 from src.utils.cookie_manager import get_platform_cookie
+from src.utils.parser_transport import report_cookie_required
 from configs.general_constants import USER_AGENT_M, USER_AGENT_PC
 from configs.logging_config import get_logger
 
@@ -16,6 +17,8 @@ logger = get_logger(__name__)
 class KuaishouParser(BaseParser):
     def __init__(self, real_url):
         super().__init__(real_url)
+        # 独立请求原本不共享 Cookie，统一传输后继续保持此行为。
+        self.session.isolate_cookies = True
 
         custom_cookie = get_platform_cookie("kuaishou")
         self.custom_cookie = custom_cookie or ""
@@ -87,7 +90,7 @@ class KuaishouParser(BaseParser):
 
     def _fetch_html_with_headers(self, url, headers):
         try:
-            resp = requests.get(url, headers=headers, timeout=5)
+            resp = self.session.get(url, headers=headers, timeout=5)
             resp.raise_for_status()
             return resp.text
         except requests.RequestException as e:
@@ -139,6 +142,7 @@ class KuaishouParser(BaseParser):
         if self._is_blocked_payload(self.html_content):
             logger.warning(f"Kuaishou blocked route {candidate_url}, trying fallback")
             self.cookie_required = True
+            report_cookie_required()
             return False
 
         page_type, structured_data = self._identify_and_parse_data()
@@ -196,10 +200,11 @@ class KuaishouParser(BaseParser):
 }"""
         }
         try:
-            resp = requests.post(graphql_url, json=payload, headers=headers, timeout=5)
+            resp = self.session.post(graphql_url, json=payload, headers=headers, timeout=5)
             if resp.status_code == 200:
                 if self._is_blocked_payload(resp.text):
                     self.cookie_required = True
+                    report_cookie_required()
                     return False
                 data = resp.json()
                 detail = data.get("data", {}).get("visionVideoDetail")

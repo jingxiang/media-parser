@@ -101,12 +101,13 @@ class ApiDocsRenderTest(unittest.TestCase):
 
     def test_session_authenticated_playground_supports_key_prefix(self):
         self.setup_customer()
-        # In a logged in session, using the selected key prefix from dropdown works
-        resp = self.client.get(
-            "/api/v1/parse?url=https://v.douyin.com/test12345/&key=mp_testkey_...",
-        )
-        # Should authenticate and proceed to execute parse (not blocked by 401 INVALID_API_KEY)
-        self.assertNotEqual(resp.status_code, 401)
+        # 此用例只验证登录态与 Key 前缀路由，不向真实平台发起请求。
+        with unittest.mock.patch("src.api.parse._execute_parse", return_value=("ok", 200)) as execute:
+            resp = self.client.get(
+                "/api/v1/parse?url=https://v.douyin.com/test12345/&key=mp_testkey_...",
+            )
+        self.assertEqual(resp.status_code, 200)
+        execute.assert_called_once()
 
     def test_unauthenticated_request_rejects_key_prefix(self):
         # Without a logged-in session, using prefix is rejected for security

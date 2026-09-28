@@ -1,4 +1,5 @@
 import requests
+from src.utils.parser_transport import ParserSession
 from bs4 import BeautifulSoup
 from configs.logging_config import get_logger
 logger = get_logger(__name__)
@@ -9,7 +10,7 @@ class BaseParser:
         self.real_url = real_url
         self.headers = None
         self.html_content = None
-        self.session = requests.Session()
+        self.session = ParserSession()
         self.terminal_error = None
         self.no_media_in_content = False
 
